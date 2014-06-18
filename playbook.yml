@@ -1,0 +1,280 @@
+---
+- name: Build a 5 node gluster cluster
+  hosts: localhost
+  gather_facts: False
+  tasks:
+    - name: Server build requests
+      local_action:
+        module: rax
+        name: gluster%d
+        flavor: performance1-1
+        image: centos-65
+        state: present
+        count: 5
+        count_offset: 1
+        exact_count: yes
+        region: IAD
+        group: glustercluster
+        networks:
+          - public
+          - private
+          - gluster-net
+        wait: yes
+      register: rax
+
+    - name: Add servers to 'raxhosts' group
+      local_action:
+        module: add_host
+        hostname: "{{ item.name }}"
+        ansible_ssh_host: "{{ item.rax_accessipv4 }}"
+        ansible_ssh_pass: "{{ item.rax_adminpass }}"
+        ansible_ssh_user: root
+        groupname: raxhosts
+      with_items: rax.success
+      when: rax.action == 'create'
+
+- name: build hosts file
+  hosts: all
+  tasks:
+  - lineinfile: dest=/etc/hosts regexp='.*{{ item }}$' line="{{ hostvars[item].ansible_eth2.ipv4.address }} {{item}}" state=present
+    when: hostvars[item].ansible_eth2.ipv4.address is defined
+    with_items: groups['all']
+  
+- name: build /etc/hosts on localhost
+  hosts: localhost
+  tasks:
+  - lineinfile: dest=/etc/hosts regexp='.*{{ item }}$' line="{{ hostvars[item].ansible_default_ipv4.address }} {{item}}" state=present
+    when: hostvars[item].ansible_default_ipv4.address is defined
+    with_items: groups['all']
+
+- name: Set up the servers
+  hosts: raxhosts
+  tasks:
+    - name: Set up gluster repo
+      command: /usr/bin/wget -P /etc/yum.repos.d http://download.gluster.org/pub/gluster/glusterfs/LATEST/CentOS/glusterfs-epel.repo
+    - name: Install packages
+      yum: name={{ item }} state=present
+      with_items:
+      - telnet
+      - vim
+      - screen
+      - curl
+      - git
+      - mlocate
+      - parted
+      - lvm2
+      - xfsprogs
+      - glusterfs 
+      - glusterfs-fuse 
+      - glusterfs-server
+      - nmap
+      - fuse
+      - fuse-libs
+      - glusterfs-rdma
+      - unzip
+    - name: Create .ssh folder
+      command: /bin/mkdir -p /root/.ssh
+    - name: Set up SSH key for Ansible master server
+      copy: src=~/.ssh/id_rsa.pub dest=~/.ssh/authorized_keys
+    - name: Allow private networks on all servers
+      command: iptables -I INPUT -s 192.168.3.0/24 -j ACCEPT
+    - name: save iptables rules
+      command: service iptables save
+
+- name: Build a Block Storage Volume
+  gather_facts: False
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Create glustor bricks
+      local_action:
+        module: rax_cbs
+        name: "{{ item }}"
+        description: Glustor Brick
+        volume_type: SATA
+        size: 100
+        region: IAD
+        wait: yes
+        state: present
+      with_items:
+          - glustor1
+          - glustor2
+          - glustor3
+          - glustor4
+      register: my_volume
+
+- name: Attach glustor volumes to gluster nodes
+  gather_facts: False
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Attach volumes to nodes
+      local_action:
+        module: rax_cbs_attachments
+        volume: glustor{{ item }}
+        server: gluster{{ item }}
+        device: /dev/xvdd
+        region: IAD
+        wait: yes
+        state: present
+      with_sequence: count=4
+      register: my_volume
+
+#TODO: remove ignore errors where possible
+- name: Prepare the bricks
+  hosts: glusternodes
+  tasks:
+    - name: set up partitions and lvm
+      command: parted -s -- /dev/xvdd mktable gpt
+      ignore_errors: yes
+    - name: make partition  
+      command: parted -s -- /dev/xvdd mkpart primary 2048s 100%
+      ignore_errors: yes
+    - name: set LVM on partition
+      command: parted -s -- /dev/xvdd set 1 lvm on
+      ignore_errors: yes
+    - name: add partition
+      command: partx -a /dev/xvdd
+      ignore_errors: yes
+    - name: create physical volume
+      command: pvcreate /dev/xvdd1
+      ignore_errors: yes
+    - name: create volume group
+      command: vgcreate vgglus1 /dev/xvdd1
+      ignore_errors: yes
+    - name: create logical volume
+      command: lvcreate -l 100%VG -n gbrick1 vgglus1
+      ignore_errors: yes
+    - name: create filesystem
+      command: mkfs.xfs -i size=512 /dev/vgglus1/gbrick1
+      ignore_errors: yes
+    - name: set up /etc/fstab
+      lineinfile: dest=/etc/fstab line="/dev/vgglus1/gbrick1 /var/lib/gvol0 xfs inode64,nobarrier 0 0" owner=root
+                  state=present insertafter=EOF create=True
+      ignore_errors: yes
+    - name: mkdir
+      command: mkdir /var/lib/gvol0
+      ignore_errors: yes
+    - name: mount
+      command: mount /var/lib/gvol0
+      ignore_errors: yes
+
+- name: Make some directories
+  gather_facts: False
+  hosts: gluster1
+  tasks:
+    - name: Create brick dir
+      file: path=/var/lib/gvol0/brick1/ state=directory
+
+
+- name: Make some directories
+  gather_facts: False
+  hosts: gluster2
+  tasks:
+    - name: Create brick dir
+      file: path=/var/lib/gvol0/brick2/ state=directory
+
+- name: Make some directories
+  gather_facts: False
+  hosts: gluster3
+  tasks:
+    - name: Create brick dir
+      file: path=/var/lib/gvol0/brick3/ state=directory
+
+- name: Make some directories
+  gather_facts: False
+  hosts: gluster4
+  tasks:
+    - name: Create brick dir
+      file: path=/var/lib/gvol0/brick4/ state=directory
+
+- name: Start glusterfd daemon on all nodes
+  gather_facts: False
+  hosts: glusternodes
+  tasks:
+    - name: start daemon
+      command: service glusterd start
+    - name: chkconfig on
+      command: chkconfig glusterd on
+
+- name: building peer groups
+  gather_facts: False
+  hosts: gluster1
+  tasks:
+    - name: peer probes
+      command: gluster peer probe gluster2
+    - name: peer probes
+      command: gluster peer probe gluster3
+    - name: peer probes
+      command: gluster peer probe gluster4
+
+- name: building peer groups
+  gather_facts: False
+  hosts: gluster2
+  tasks:
+    - name: peer probes
+      command: gluster peer probe gluster1
+    - name: peer probes
+      command: gluster peer probe gluster3
+    - name: peer probes
+      command: gluster peer probe gluster4
+
+- name: building peer groups
+  gather_facts: False
+  hosts: gluster3
+  tasks:
+    - name: peer probes
+      command: gluster peer probe gluster1
+    - name: peer probes
+      command: gluster peer probe gluster2
+    - name: peer probes
+      command: gluster peer probe gluster4
+
+- name: building peer groups
+  gather_facts: False
+  hosts: gluster4
+  tasks:
+    - name: peer probes
+      command: gluster peer probe gluster1
+    - name: peer probes
+      command: gluster peer probe gluster2
+    - name: peer probes
+      command: gluster peer probe gluster3
+
+- name: Create distributed-replicated volumes
+  gather_facts: False
+  hosts: gluster1
+  tasks:
+    - name: create the gluster volume
+      shell: gluster volume create gvol0 replica 2 transport tcp \
+             gluster1:/var/lib/gvol0/brick1 \
+             gluster2:/var/lib/gvol0/brick2 \
+             gluster3:/var/lib/gvol0/brick3 \
+             gluster4:/var/lib/gvol0/brick4
+    - name: Allow any ip 
+      shell: gluster volume set gvol0 auth.allow 192.168.3.*
+    - name: Enable NFS
+      shell: gluster volume set gvol0 nfs.disable off
+    - name: Disable namelookup
+      shell: gluster volume set gvol0 nfs.addr-namelookup off
+    - name: export nfs volumes on
+      shell: gluster volume set gvol0 nfs.export-volumes on
+    - name: allow nfs rpc auth 
+      shell: gluster volume set gvol0 nfs.rpc-auth-allow 192.168.3.*
+    - name: start gluster volume
+      shell: gluster volume start gvol0
+
+- name: Set up the client server
+  gather_facts: False
+  hosts: gluster5
+  tasks: 
+    - name: modprobe
+      command: modprobe fuse
+    - name: set up /etc/fstab
+      lineinfile: dest=/etc/fstab line="gluster1:/gvol0 /mnt/gluster/gvol0 glusterfs defaults,_netdev 0 0" owner=root
+                  state=present insertafter=EOF create=True
+    - name: Create directory
+      command: mkdir -p /mnt/gluster/gvol0
+    - name: mount gvol0
+      command: mount /mnt/gluster/gvol0
+
